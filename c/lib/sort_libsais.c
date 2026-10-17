@@ -156,7 +156,7 @@ size_t
 bzng_bwt_work_ints(s32 n)
 {
 	/*
-	 * The suffix array, at least floor(n/2) of free space, and the
+	 * libsais's n entries, at least floor(n/2) of free space, and the
 	 * context's buckets.
 	 */
 	return (size_t)n + (size_t)n / 2 + SAIS_CTX_BUCKET_INTS;
@@ -183,8 +183,8 @@ bzng_bwt(const u8 *T, u8 *L, s32 n, s32 q, s32 *freq, s32 *work,
 	}
 
 	/*
-	 * The suffix array at the start of work, the context's buckets at its
-	 * end, and everything between them as libsais's free space, which
+	 * libsais's n entries at the start of work, the context's buckets at
+	 * its end, and everything between them as libsais's free space, which
 	 * satisfies the bound above; a single-thread context is no more than
 	 * its bucket counters.
 	 */
@@ -197,25 +197,28 @@ bzng_bwt(const u8 *T, u8 *L, s32 n, s32 q, s32 *freq, s32 *work,
 		.thread_state = NULL,
 		.threads = 1,
 	};
-	s32 *SA = work;
-	if (libsais_ctx(&ctx, T, SA, n, (s32)fs, freq) != 0)
+	/*
+	 * libsais's BWT mode with patch 0002: the final induction leaves in
+	 * each row's entry the byte before that row's suffix, stores the row of
+	 * suffix q in row and returns the row of suffix 0.
+	 */
+	s32 *A = work;
+	s32 row = -1;
+	s32 first = libsais_main_ctx(&ctx, T, A, n,
+				     LIBSAIS_FLAGS_BWT | LIBSAIS_FLAGS_BWT_ROW,
+				     q, &row, (s32)fs, freq);
+	if (first < 0 || row < 0)
 		return -2;
 	/* T is a Lyndon word exactly when suffix 0 is the least suffix. */
-	if (SA[0] != 0)
+	if (first != 0)
 		return -3;
 
 	/*
-	 * Suffix order is rotation order, so row i ends with the byte before
-	 * suffix SA[i]. The bytes go to the free space first, since L may be T.
+	 * Suffix order is rotation order, so row 0, suffix 0's, ends with
+	 * T[n - 1], and every other row's entry already holds its last byte.
+	 * The induction has finished with T, so L may be T.
 	 */
-	u8 *bwt = (u8 *)(SA + n);
-	s32 row = 0;
-	bwt[0] = T[n - 1];
-	for (s32 i = 1; i < n; i++) {
-		s32 s = SA[i];
-		bwt[i] = T[s - 1];
-		row = s == q ? i : row;
-	}
-	memcpy(L, bwt, (size_t)n);
+	L[0] = T[n - 1];
+	libsais_bwt_copy_8u(L + 1, A + 1, n - 1);
 	return row;
 }
