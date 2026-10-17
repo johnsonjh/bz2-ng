@@ -35,9 +35,10 @@ typedef size_t (*rle_fill_func_t)(struct bzng_rle_state *st, const u8 *in,
 				  size_t avail, u8 *blk, s32 nblock_max);
 
 /*
- * MTF and zero-run coding of the BWT L[0..n) with the bytes marked in in_use:
- * the values to mtfv (which may be written up to 8 entries past them) and
- * their counts to mtf_freq.  Returns the number of values.
+ * MTF and zero-run coding of the BWT L[0..n), whose bytes are those c with
+ * in_use[c] = 1 (the others 0): the values to mtfv (which may be written up to
+ * 8 entries past them) and their counts to mtf_freq.  Returns the number of
+ * values.
  */
 typedef s32 (*mtf_func_t)(const u8 *L, s32 n, const u8 *in_use, u16 *mtfv,
 			  s32 *mtf_freq);

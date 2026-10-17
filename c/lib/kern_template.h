@@ -489,23 +489,15 @@ tail:
  * sequence numbers.
  * - Rank 0 is exactly L[i] == L[i-1], so only positions where the byte
  *   changes are visited (64-position change masks, vector tiers).
- * - List positions 0..7 live in one 64-bit register (head): ranks 1-7 are a
- *   SWAR byte search and a bit-select update.
- * - Positions 8..255 live in a 16-byte-aligned array (tail), searched and
+ * - List positions 0..7 and 8..15 live in two 64-bit registers (head,
+ *   head1): ranks 1-15 are a SWAR byte search and a bit-select update, so
+ *   the common ranks never touch memory.
+ * - Positions 16..255 live in a 16-byte-aligned array (tail), searched and
  *   shifted in one pass, 16 bytes at a time (vector) or 8 (scalar).
  * - Zero runs: the RUNA/RUNB digits of a run of z are the bits of z + 1
  *   below its leading one, least significant first, written with one
  *   unconditional store and counted with a popcount.
  */
-
-/*
- * The MTF list: entries 0..7 in head (entry 0 in the low byte), 8..255 in
- * tail.
- */
-typedef struct {
-	u64 head;
-	_Alignas(16) u8 tail[256];
-} mtf_list;
 
 /*
  * Writes the digits of a zero run of length z >= 0 at mtfv[wr]; returns the
@@ -558,16 +550,16 @@ put_zero_run(u16 *mtfv, s32 wr, s32 *mtf_freq, u32 z)
 }
 
 /*
- * Moves byte c (known to be at list position >= 8) to the front; returns its
- * rank.
+ * Takes byte c out of the tail (list positions 16..255): the entries before
+ * it move one position on and carry, the entry leaving position 15, takes
+ * position 16.  Returns c's rank.
  */
 static inline s32
-tail_move_to_front(mtf_list *lst, u8 c)
+tail_move_to_front(u8 *tail, u8 carry, u8 c)
 {
-	u8 *tail = lst->tail;
 	s32 r;
 #if VEC_ENABLED
-	vec_t vc = vec_dup(c), prev = vec_dup((u8)(lst->head >> 56));
+	vec_t vc = vec_dup(c), prev = vec_dup(carry);
 	for (s32 k = 0;; k++) {
 		vec_t cur = vec_ld(tail + 16 * k);
 		vec_t shifted = vec_shift1(prev, cur);
@@ -576,54 +568,83 @@ tail_move_to_front(mtf_list *lst, u8 c)
 			s32 lane = (s32)(bsf64(m) >> VEC_SHIFT);
 			vec_st(tail + 16 * k,
 			       vec_sel_upto((unsigned)lane, shifted, cur));
-			r = 8 + 16 * k + lane;
+			r = 16 + 16 * k + lane;
 			break;
 		}
 		vec_st(tail + 16 * k, shifted);
 		prev = cur;
 	}
 #else
-	u64 vc = 0x0101010101010101ULL * c, carry = lst->head >> 56;
+	u64 vc = 0x0101010101010101ULL * c, in = carry;
 	for (s32 k = 0;; k++) {
 		u64 w;
 		memcpy(&w, tail + 8 * k, 8);
 		if (!CPU_IS_LITTLE_ENDIAN())
 			w = bswap64(w);
-		u64 shifted = (w << 8) | carry, z = zero_bytes(w ^ vc);
+		u64 shifted = (w << 8) | in, z = zero_bytes(w ^ vc);
 		if (z) {
 			u64 upto = (z << 1) - 1;
 			w ^= (w ^ shifted) & upto;
 			if (!CPU_IS_LITTLE_ENDIAN())
 				w = bswap64(w);
 			memcpy(tail + 8 * k, &w, 8);
-			r = 8 + 8 * k + (s32)(bsf64(z) >> 3);
+			r = 16 + 8 * k + (s32)(bsf64(z) >> 3);
 			break;
 		}
 		if (!CPU_IS_LITTLE_ENDIAN())
 			shifted = bswap64(shifted);
 		memcpy(tail + 8 * k, &shifted, 8);
-		carry = w >> 56;
+		in = w >> 56;
 	}
 #endif
-	lst->head = (lst->head << 8) | c;
 	return r;
 }
 
-#define MTF_SYMBOL(c)                                                   \
-	do {                                                            \
-		u8 c_ = (c);                                            \
-		u64 h_ = lst.head;                                      \
-		u64 z_ = zero_bytes(h_ ^ (0x0101010101010101ULL * c_)); \
-		s32 r_;                                                 \
-		if (likely(z_)) {                                       \
-			r_ = (s32)(bsf64(z_) >> 3);                     \
-			lst.head = h_ ^ ((h_ ^ ((h_ << 8) | c_)) &      \
-					 ((z_ << 1) - 1));              \
-		} else {                                                \
-			r_ = tail_move_to_front(&lst, c_);              \
-		}                                                       \
-		mtfv[wr++] = (u16)(r_ + 1);                             \
-		mtf_freq[r_ + 1]++;                                     \
+/*
+ * 0x80 in the lowest zero byte of x, and perhaps in bytes above it, where the
+ * borrow reaches.  A list word xor c has at most one zero byte (the list holds
+ * each byte in use once, and the filler is not in use), so the lowest flag is
+ * the match, and z ^ (z - 1) masks the bytes up to it.  It keeps the chain
+ * from one symbol's head to the next two operations shorter than zero_bytes()
+ * would.
+ */
+static forceinline u64
+borrow_zero_bytes(u64 x)
+{
+	return (x - 0x0101010101010101ULL) & ~x & 0x8080808080808080ULL;
+}
+
+/*
+ * Moves c to the front of the list and codes its rank.  The list is entries
+ * 0..7 in head (entry 0 in the low byte), 8..15 in head1 and 16..255 in tail;
+ * the head words are locals whose address is never taken, so compilers keep
+ * them in registers.  Ranks below 16 take no branch: at most one of z0 and z1
+ * is nonzero, z0 ^ (z0 - 1) is all ones when z0 is 0 (head then shifts up
+ * whole, its last entry going to head1), and z1 >> 7 lets one bit scan find
+ * either flag.
+ */
+#define MTF_SYMBOL(c)                                                          \
+	do {                                                                   \
+		u8 c_ = (c);                                                   \
+		u64 cc_ = 0x0101010101010101ULL * c_;                          \
+		u64 z0_ = borrow_zero_bytes(head ^ cc_);                       \
+		u64 z1_ = borrow_zero_bytes(head1 ^ cc_);                      \
+		s32 r_;                                                        \
+		if (likely(z0_ | z1_)) {                                       \
+			u64 m1_ = (z1_ ^ (z1_ - 1)) & ((u64)0 - (z1_ != 0));   \
+			r_ = (s32)(bsf64(z0_ | z1_ >> 7) >> 3) +               \
+			     8 * (z0_ == 0);                                   \
+			head1 ^=                                               \
+				(head1 ^ ((head1 << 8) | (head >> 56))) & m1_; \
+			head ^= (head ^ ((head << 8) | c_)) &                  \
+				(z0_ ^ (z0_ - 1));                             \
+		} else {                                                       \
+			r_ = tail_move_to_front(tail, (u8)(head1 >> 56), c_);  \
+			head1 = (head1 << 8) | (head >> 56);                   \
+			head = (head << 8) | c_;                               \
+		}                                                              \
+		mtfv[wr++] = (u16)(r_ + 1);                                    \
+		mtf_freq[r_ + 1]++;                                            \
 	} while (0)
 
 s32
@@ -632,9 +653,11 @@ ADD_SUFFIX(bzng_mtf)(const u8 *L, s32 n, const u8 *in_use, u16 *mtfv,
 {
 	u8 list[256 + 16];
 	s32 n_in_use = 0;
-	for (int i = 0; i < 256; i++)
-		if (in_use[i])
-			list[n_in_use++] = (u8)i;
+	/* No branch per byte: an irregular alphabet would mispredict. */
+	for (int i = 0; i < 256; i++) {
+		list[n_in_use] = (u8)i;
+		n_in_use += in_use[i];
+	}
 	/*
 	 * Unused slots must never match a symbol: fill with a byte not in use
 	 * (there is one whenever there are unused slots).
@@ -647,12 +670,11 @@ ADD_SUFFIX(bzng_mtf)(const u8 *L, s32 n, const u8 *in_use, u16 *mtfv,
 		}
 	for (int i = n_in_use; i < 256 + 16; i++)
 		list[i] = filler;
-	mtf_list lst;
-	memcpy(&lst.head, list, 8);
-	if (!CPU_IS_LITTLE_ENDIAN())
-		lst.head = bswap64(lst.head);
-	memcpy(lst.tail, list + 8, 248);
-	memset(lst.tail + 248, filler, 8);
+	u64 head = get_unaligned_le64(list),
+	    head1 = get_unaligned_le64(list + 8);
+	_Alignas(16) u8 tail[256];
+	memcpy(tail, list + 16, 240);
+	memset(tail + 240, filler, 16);
 
 	s32 eob = n_in_use + 1;
 	for (s32 i = 0; i <= eob; i++)
@@ -664,7 +686,7 @@ ADD_SUFFIX(bzng_mtf)(const u8 *L, s32 n, const u8 *in_use, u16 *mtfv,
 
 	/* Position 0 compares with the list head (seq 0), the others with
 	 * L[i-1]. */
-	if (L[0] == (u8)lst.head)
+	if (L[0] == (u8)head)
 		z_pend = 1;
 	else
 		MTF_SYMBOL(L[0]);
