@@ -29,7 +29,12 @@ struct bzng_unrle_io;
 /*
  * Encoder input stage: RLE1 of in[0..avail) into the block blk, with the run
  * state and block CRC carried between calls in *st (enc.h).  Returns the
- * number of bytes consumed.
+ * number of bytes consumed.  A block is full once a unit brings it to
+ * nblock_max or more, so it ends up to 4 bytes past nblock_max, and the
+ * kernels store past the block's end as well: 8-byte unit stores in every
+ * tier and whole-vector literal copies in the vector tiers, at most 24
+ * bytes past nblock_max in all.  The caller's block array (enc.h) has that
+ * slack.
  */
 typedef size_t (*rle_fill_func_t)(struct bzng_rle_state *st, const u8 *in,
 				  size_t avail, u8 *blk, s32 nblock_max);
